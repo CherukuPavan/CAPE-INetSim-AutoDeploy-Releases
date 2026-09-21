@@ -15,3 +15,9 @@ Copyright © 2026 CherukuPavan. All rights reserved.
 No open-source license is granted by this repository. Public availability is for release distribution and verification; it does not grant permission to relicense, redistribute, or represent the work as another party's own work.
 
 Do not place credentials, private lab evidence, machine inventories, development source history, or host-specific configuration in this repository.
+
+## Current test release
+
+The current compatibility-test prerelease is `v1.0.0-rc.5`. Earlier release candidates are superseded and should not be used for qualification.
+
+The intended random-host entry point is the versioned `install` release asset; it downloads and checksum-verifies the stripped runtime bundle and the generalized appliance before deployment.
