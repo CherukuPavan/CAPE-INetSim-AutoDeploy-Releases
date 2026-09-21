@@ -18,6 +18,6 @@ Do not place credentials, private lab evidence, machine inventories, development
 
 ## Current test release
 
-The current compatibility-test prerelease is `v1.0.0-rc.5`. Earlier release candidates are superseded and should not be used for qualification.
+The current compatibility-test prerelease is `v1.0.0-rc.6`. Earlier release candidates are superseded and should not be used for qualification.
 
 The intended random-host entry point is the versioned `install` release asset; it downloads and checksum-verifies the stripped runtime bundle and the generalized appliance before deployment.
