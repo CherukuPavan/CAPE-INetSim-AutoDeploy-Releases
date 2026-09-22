@@ -78,25 +78,7 @@ p=pathlib.Path(sys.argv[1])
 s=p.read_text()
 
 old_verify="""  grep -Fxq 'default4=1' <<<"$runtime" || { fail "INetSim appliance does not have exactly one IPv4 management default route"; return 1; }"""
-new_verify="""  grep -Eq '^default4=(0|1)
-bash -n "$ROOT/install"
-if grep -Fq 'virsh net-info "$ISOLATED_NETWORK_NAME" | grep -Eq' "$TARGET"; then
-  echo "[FAIL] exit-141 hotfix verification failed" >&2
-  exit 2
-fi
-
-chmod +x "$ROOT/install" "$ROOT"/bin/* 2>/dev/null || true
-export CAPE_INETSIM_RELEASE_TAG="$TAG"
-export CAPE_INETSIM_RELEASE_SOURCE_BUNDLE="$SOURCE_NAME"
-export CAPE_INETSIM_RELEASE_SOURCE_SHA256="$SOURCE_SHA256"
-export CAPE_INETSIM_RELEASE_SOURCE_COMMIT="$SOURCE_COMMIT"
-export CAPE_INETSIM_RC10_EXIT141_HOTFIX=1
-
-echo "[PASS] Verified immutable RC10 source bundle"
-echo "[PASS] Applied isolated-network SIGPIPE/exit-141 hotfix in temporary runtime copy"
-echo "[PASS] Applied host-only management-network compatibility hotfix"
-"$ROOT/install" "$@"
- <<<"$runtime" || { fail "INetSim appliance has more than one IPv4 default route"; return 1; }"""
+new_verify="""  grep -Eq '^default4=(0|1)$' <<<"$runtime" || { fail "INetSim appliance has more than one IPv4 default route"; return 1; }"""
 if s.count(old_verify) != 1:
     raise SystemExit("unexpected RC10 host default-route verification layout")
 s=s.replace(old_verify,new_verify,1)
@@ -115,7 +97,7 @@ old="""DEFAULTS="$(ip -4 route show default | wc -l)"
 ip -4 route show default | grep -Fq "dev $MGMT_IF"
 ! ip -4 route show default | grep -Fq "dev $ISO_IF""""
 new="""DEFAULT_ROUTE="$(ip -4 route show default)"
-DEFAULTS="$(awk '"'"'NF{n++} END{print n+0}'"'"' <<<"$DEFAULT_ROUTE")"
+DEFAULTS="$(ip -4 route show default | wc -l)"
 [[ "$DEFAULTS" -le 1 ]] || { echo "expected at most one management default route, found $DEFAULTS" >&2; exit 33; }
 if [[ "$DEFAULTS" -eq 1 ]]; then
   grep -Fq "dev $MGMT_IF" <<<"$DEFAULT_ROUTE" || { echo "default route is not on management interface $MGMT_IF" >&2; exit 34; }
@@ -154,4 +136,5 @@ export CAPE_INETSIM_RC10_EXIT141_HOTFIX=1
 
 echo "[PASS] Verified immutable RC10 source bundle"
 echo "[PASS] Applied isolated-network SIGPIPE/exit-141 hotfix in temporary runtime copy"
+echo "[PASS] Applied host-only management-network compatibility hotfix"
 "$ROOT/install" "$@"
