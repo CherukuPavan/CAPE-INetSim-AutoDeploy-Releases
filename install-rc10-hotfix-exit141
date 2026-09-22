@@ -43,7 +43,8 @@ PY
 tar -xzf "$TMP/$SOURCE_NAME" -C "$TMP" --no-same-owner --no-same-permissions
 ROOT="$TMP/$EXPECTED_ROOT"
 TARGET="$ROOT/lib/isolated-network.sh"
-[[ -f "$ROOT/install" && -f "$TARGET" ]] || {
+INETSIM_TARGET="$ROOT/lib/inetsim-vm.sh"
+[[ -f "$ROOT/install" && -f "$TARGET" && -f "$INETSIM_TARGET" ]] || {
   echo "[FAIL] verified RC10 source bundle layout is invalid" >&2
   exit 2
 }
@@ -71,7 +72,73 @@ s=s.replace(old,new)
 p.write_text(s)
 PY
 
+python3 - "$INETSIM_TARGET" <<'PY'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1])
+s=p.read_text()
+
+old_verify="""  grep -Fxq 'default4=1' <<<"$runtime" || { fail "INetSim appliance does not have exactly one IPv4 management default route"; return 1; }"""
+new_verify="""  grep -Eq '^default4=(0|1)
+bash -n "$ROOT/install"
+if grep -Fq 'virsh net-info "$ISOLATED_NETWORK_NAME" | grep -Eq' "$TARGET"; then
+  echo "[FAIL] exit-141 hotfix verification failed" >&2
+  exit 2
+fi
+
+chmod +x "$ROOT/install" "$ROOT"/bin/* 2>/dev/null || true
+export CAPE_INETSIM_RELEASE_TAG="$TAG"
+export CAPE_INETSIM_RELEASE_SOURCE_BUNDLE="$SOURCE_NAME"
+export CAPE_INETSIM_RELEASE_SOURCE_SHA256="$SOURCE_SHA256"
+export CAPE_INETSIM_RELEASE_SOURCE_COMMIT="$SOURCE_COMMIT"
+export CAPE_INETSIM_RC10_EXIT141_HOTFIX=1
+
+echo "[PASS] Verified immutable RC10 source bundle"
+echo "[PASS] Applied isolated-network SIGPIPE/exit-141 hotfix in temporary runtime copy"
+echo "[PASS] Applied host-only management-network compatibility hotfix"
+"$ROOT/install" "$@"
+ <<<"$runtime" || { fail "INetSim appliance has more than one IPv4 default route"; return 1; }"""
+if s.count(old_verify) != 1:
+    raise SystemExit("unexpected RC10 host default-route verification layout")
+s=s.replace(old_verify,new_verify,1)
+
+configure_marker='inetsim_configure_guest() {\n'
+if s.count(configure_marker) != 1:
+    raise SystemExit("unexpected RC10 INetSim configure function layout")
+
+helper=r'''inetsim_hotfix_guest_route_policy() {
+  qga_exec_wait "$INETSIM_DOMAIN_NAME" /usr/bin/python3 -c '
+import pathlib
+p=pathlib.Path("/usr/local/sbin/cape-inetsim-guest-configure")
+s=p.read_text()
+old="""DEFAULTS="$(ip -4 route show default | wc -l)"
+[[ "$DEFAULTS" -eq 1 ]] || { echo "expected exactly one management default route, found $DEFAULTS" >&2; exit 33; }
+ip -4 route show default | grep -Fq "dev $MGMT_IF"
+! ip -4 route show default | grep -Fq "dev $ISO_IF""""
+new="""DEFAULT_ROUTE="$(ip -4 route show default)"
+DEFAULTS="$(awk '"'"'NF{n++} END{print n+0}'"'"' <<<"$DEFAULT_ROUTE")"
+[[ "$DEFAULTS" -le 1 ]] || { echo "expected at most one management default route, found $DEFAULTS" >&2; exit 33; }
+if [[ "$DEFAULTS" -eq 1 ]]; then
+  grep -Fq "dev $MGMT_IF" <<<"$DEFAULT_ROUTE" || { echo "default route is not on management interface $MGMT_IF" >&2; exit 34; }
+  ! grep -Fq "dev $ISO_IF" <<<"$DEFAULT_ROUTE" || { echo "isolated interface $ISO_IF unexpectedly has a default route" >&2; exit 35; }
+fi"""
+if s.count(old) != 1:
+    raise SystemExit("unexpected baked RC10 guest route-check layout")
+p.write_text(s.replace(old,new,1))
+' || return 1
+}
+
+'''
+s=s.replace(configure_marker,helper+configure_marker,1)
+
+call='  qga_exec_wait "$INETSIM_DOMAIN_NAME" /usr/local/sbin/cape-inetsim-guest-configure --management-mac "$INETSIM_MANAGEMENT_MAC" --isolated-mac "$INETSIM_ISOLATED_MAC" --ip "$INETSIM_IP/24"'
+if s.count(call) != 1:
+    raise SystemExit("unexpected RC10 guest configure call layout")
+s=s.replace(call,'  inetsim_hotfix_guest_route_policy\n'+call,1)
+p.write_text(s)
+PY
+
 bash -n "$TARGET"
+bash -n "$INETSIM_TARGET"
 bash -n "$ROOT/install"
 if grep -Fq 'virsh net-info "$ISOLATED_NETWORK_NAME" | grep -Eq' "$TARGET"; then
   echo "[FAIL] exit-141 hotfix verification failed" >&2
