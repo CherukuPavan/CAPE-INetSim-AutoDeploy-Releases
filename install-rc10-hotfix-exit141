@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO="CherukuPavan/CAPE-INetSim-AutoDeploy-Releases"
+TAG="v1.0.0-rc.10"
+SOURCE_NAME="CAPE-INetSim-AutoDeploy-1.0.0-rc.10.tar.gz"
+SOURCE_SHA256="99ca2de0eadedbb4f46d320e2aa71cb1987fecffa6c7565256ffb1111cd6ae1b"
+SOURCE_COMMIT="3470d6e03246bab457a35c3bf906c8cb781bcf8e"
+SOURCE_URL="https://github.com/$REPO/releases/download/$TAG/$SOURCE_NAME"
+
+for cmd in curl tar sha256sum python3; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "[FAIL] $cmd is required" >&2; exit 2; }
+done
+
+TMP="$(mktemp -d /tmp/cape-inetsim-autodeploy-hotfix.XXXXXX)"
+cleanup(){ rm -rf "$TMP"; }
+trap cleanup EXIT
+
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  "$SOURCE_URL" -o "$TMP/$SOURCE_NAME"
+printf '%s  %s\n' "$SOURCE_SHA256" "$TMP/$SOURCE_NAME" | sha256sum -c - >/dev/null
+
+EXPECTED_ROOT="CAPE-INetSim-AutoDeploy-1.0.0-rc.10"
+python3 - "$TMP/$SOURCE_NAME" "$EXPECTED_ROOT" <<'PY'
+import pathlib,sys,tarfile
+archive,root=sys.argv[1:]
+with tarfile.open(archive,"r:gz") as tf:
+    members=tf.getmembers()
+    if not members:
+        raise SystemExit("release source bundle is empty")
+    prefix=root.rstrip("/")+"/"
+    for m in members:
+        name=m.name
+        p=pathlib.PurePosixPath(name)
+        if p.is_absolute() or ".." in p.parts:
+            raise SystemExit(f"unsafe path in release source bundle: {name}")
+        if name != root and not name.startswith(prefix):
+            raise SystemExit(f"unexpected top-level path in release source bundle: {name}")
+        if m.isdev() or m.isfifo():
+            raise SystemExit(f"unsafe special file in release source bundle: {name}")
+PY
+
+tar -xzf "$TMP/$SOURCE_NAME" -C "$TMP" --no-same-owner --no-same-permissions
+ROOT="$TMP/$EXPECTED_ROOT"
+TARGET="$ROOT/lib/isolated-network.sh"
+[[ -f "$ROOT/install" && -f "$TARGET" ]] || {
+  echo "[FAIL] verified RC10 source bundle layout is invalid" >&2
+  exit 2
+}
+
+python3 - "$TARGET" <<'PY'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1])
+s=p.read_text()
+marker='isolated_network_exists() { virsh net-info "$1" >/dev/null 2>&1; }\n'
+old='virsh net-info "$ISOLATED_NETWORK_NAME" | grep -Eq \'^Active:[[:space:]]+yes\''
+new='isolated_network_is_active "$ISOLATED_NETWORK_NAME"'
+helper='''\nisolated_network_is_active() {
+  local text
+  text="$(virsh net-info "$1" 2>/dev/null)" || return 1
+  grep -Eq '^Active:[[:space:]]+yes' <<<"$text"
+}
+'''
+count=s.count(old)
+if count != 3:
+    raise SystemExit(f"unexpected RC10 network-check layout: expected 3 vulnerable checks, found {count}")
+if marker not in s:
+    raise SystemExit("RC10 helper insertion marker not found")
+s=s.replace(marker, marker+helper, 1)
+s=s.replace(old,new)
+p.write_text(s)
+PY
+
+bash -n "$TARGET"
+bash -n "$ROOT/install"
+if grep -Fq 'virsh net-info "$ISOLATED_NETWORK_NAME" | grep -Eq' "$TARGET"; then
+  echo "[FAIL] exit-141 hotfix verification failed" >&2
+  exit 2
+fi
+
+chmod +x "$ROOT/install" "$ROOT"/bin/* 2>/dev/null || true
+export CAPE_INETSIM_RELEASE_TAG="$TAG"
+export CAPE_INETSIM_RELEASE_SOURCE_BUNDLE="$SOURCE_NAME"
+export CAPE_INETSIM_RELEASE_SOURCE_SHA256="$SOURCE_SHA256"
+export CAPE_INETSIM_RELEASE_SOURCE_COMMIT="$SOURCE_COMMIT"
+export CAPE_INETSIM_RC10_EXIT141_HOTFIX=1
+
+echo "[PASS] Verified immutable RC10 source bundle"
+echo "[PASS] Applied isolated-network SIGPIPE/exit-141 hotfix in temporary runtime copy"
+"$ROOT/install" "$@"
