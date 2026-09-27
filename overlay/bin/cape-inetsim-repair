@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${AUTODEPLOY_ROOT:-/usr/local/lib/cape-inetsim-autodeploy}"
+[[ -f "$ROOT/lib/state.sh" ]] || ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AUTODEPLOY_ROOT="$ROOT"
+export AUTODEPLOY_ROOT
+
+source "$ROOT/lib/common.sh"
+source "$ROOT/lib/targets.sh"
+source "$ROOT/lib/state.sh"
+source "$ROOT/lib/transaction.sh"
+source "$ROOT/lib/decision.sh"
+source "$ROOT/lib/inventory.sh"
+source "$ROOT/lib/cape.sh"
+source "$ROOT/lib/libvirt.sh"
+source "$ROOT/lib/network.sh"
+source "$ROOT/lib/compat.sh"
+source "$ROOT/lib/appliance.sh"
+source "$ROOT/lib/qga.sh"
+source "$ROOT/lib/windows-network-guard.sh"
+source "$ROOT/lib/isolated-network.sh"
+source "$ROOT/lib/firewall.sh"
+source "$ROOT/lib/inetsim-vm.sh"
+source "$ROOT/lib/cape-configure.sh"
+source "$ROOT/lib/extension.sh"
+source "$ROOT/lib/services.sh"
+source "$ROOT/lib/maintenance.sh"
+source "$ROOT/lib/validate.sh"
+
+require_root
+transaction_lock_acquire
+state_load || { fail "No deployment state exists"; exit 1; }
+PERSISTED_CAPE_ROOT="$CAPE_ROOT"
+DISCOVERY_ERRORS=()
+COMPAT_NOTES=()
+discover_cape_root
+[[ "$CAPE_ROOT" == "$PERSISTED_CAPE_ROOT" ]] || {
+  fail "Live CAPE root changed since deployment: persisted=$PERSISTED_CAPE_ROOT discovered=${CAPE_ROOT:-none}"
+  exit 24
+}
+discover_cape_services
+discover_cape_runtime || { fail "Could not rediscover the live CAPE Python runtime for repair"; exit 24; }
+DEPLOYMENT_DECISION="repair"
+DEPLOYMENT_DECISION_REASON="Explicit or decision-engine repair/upgrade of existing owned deployment"
+inventory_write_json
+CAPE_TARGETS_COUNT="$(targets_count)"
+((CAPE_TARGETS_COUNT > 0)) || { fail "Deployment state contains no managed CAPE analysis machines"; exit 1; }
+targets_bind 0
+if git -C "$CAPE_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  CURRENT_CAPE_COMMIT="$(git -C "$CAPE_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  [[ -z "${CAPE_COMMIT:-}" || "$CAPE_COMMIT" == unknown || "$CURRENT_CAPE_COMMIT" == "$CAPE_COMMIT" ]] || {
+    fail "CAPE commit changed since deployment; repair will not patch a new source tree automatically."
+    exit 25
+  }
+fi
+case "${DEPLOYMENT_PHASE:-}" in
+  committed|repairing|repair-incomplete|cape-configured|extension-installed) ;;
+  *) fail "Repair is not safe from deployment phase: ${DEPLOYMENT_PHASE:-unknown}"; exit 2 ;;
+esac
+
+LEGACY_ROUTE_UPGRADE=no
+if grep -q 'CAPE_INETSIM_AUTODEPLOY_CAPTURE_V1' "$CAPE_ROOT/modules/auxiliary/sniffer.py" 2>/dev/null ||
+   grep -Rqs 'CAPE_INETSIM_VM_ROUTE_NONE_V1' "$CAPE_ROOT/web" 2>/dev/null; then
+  state_resource_owned cape-file "$CAPE_ROOT/modules/auxiliary/sniffer.py" || {
+    fail "Legacy route-global CAPE patch is not transaction-owned; refusing migration"
+    exit 28
+  }
+  state_resource_owned extension "CAPE-INetSim-VM-Extension-v1.0.2" || {
+    fail "Legacy route-global web extension is not transaction-owned; refusing migration"
+    exit 28
+  }
+  LEGACY_ROUTE_UPGRADE=yes
+  CAPE_INETSIM_ALLOW_LEGACY_UPGRADE=yes
+  export CAPE_INETSIM_ALLOW_LEGACY_UPGRADE
+  info "Owned legacy route-global deployment detected; preparing route-separated migration"
+fi
+
+REPAIR_CAPE_ACTIVE="$(service_active_flag "$CAPE_SCHEDULER_SERVICE")"
+REPAIR_PROCESSOR_ACTIVE="$(service_active_flag "${CAPE_PROCESSOR_SERVICE:-}")"
+REPAIR_WEB_ACTIVE="$(service_active_flag "${CAPE_WEB_SERVICE:-}")"
+REPAIR_ROOTER_SERVICE="${CAPE_ROOTER_SERVICE:-}"
+REPAIR_ROOTER_PRESENT="$(service_present_flag "$REPAIR_ROOTER_SERVICE")"
+REPAIR_ROOTER_ACTIVE="$(service_active_flag "$REPAIR_ROOTER_SERVICE")"
+REPAIR_ROOTER_ENABLED="$(service_enabled_flag "$REPAIR_ROOTER_SERVICE")"
+REPAIR_IPV4_FORWARD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+REPAIR_ROUTING_SYSCTL_EXISTED=no
+[[ -e "$ROUTING_SYSCTL_FILE" ]] && REPAIR_ROUTING_SYSCTL_EXISTED=yes
+REPAIR_MAINTENANCE_ACQUIRED=no
+
+# RC61 and older state predates explicit ownership of Rooter enablement and
+# host IPv4 forwarding. Adopt the current pre-repair values exactly once.
+if [[ -z "${CAPE_ROOTER_WAS_ENABLED:-}" ]]; then
+  CAPE_ROOTER_WAS_ENABLED="$REPAIR_ROOTER_ENABLED"
+fi
+if [[ -z "${HOST_IPV4_FORWARD_WAS:-}" ]]; then
+  HOST_IPV4_FORWARD_WAS="$REPAIR_IPV4_FORWARD"
+fi
+state_write_atomic
+
+repair_restore_runtime() {
+  local rc="$1"
+  trap - ERR INT TERM
+  set +e
+
+  if [[ "$REPAIR_MAINTENANCE_ACQUIRED" == yes && -f "$CAPE_MAINTENANCE_GUARD_FILE" ]]; then
+    if systemctl is-active --quiet "$CAPE_SCHEDULER_SERVICE"; then
+      systemctl stop "$CAPE_SCHEDULER_SERVICE" >/dev/null 2>&1 || true
+    fi
+    cape_release_maintenance >/dev/null 2>&1 || true
+  fi
+
+  services_start_if_expected "${CAPE_PROCESSOR_SERVICE:-}" "$REPAIR_PROCESSOR_ACTIVE" >/dev/null 2>&1 || true
+  services_start_if_expected "${CAPE_WEB_SERVICE:-}" "$REPAIR_WEB_ACTIVE" >/dev/null 2>&1 || true
+  if [[ "$REPAIR_ROOTER_PRESENT" == yes && -n "$REPAIR_ROOTER_SERVICE" ]]; then
+    if [[ "$REPAIR_ROOTER_ACTIVE" == yes ]]; then systemctl start "$REPAIR_ROOTER_SERVICE" >/dev/null 2>&1 || true; else systemctl stop "$REPAIR_ROOTER_SERVICE" >/dev/null 2>&1 || true; fi
+    if [[ "$REPAIR_ROOTER_ENABLED" == yes ]]; then systemctl enable "$REPAIR_ROOTER_SERVICE" >/dev/null 2>&1 || true; else systemctl disable "$REPAIR_ROOTER_SERVICE" >/dev/null 2>&1 || true; fi
+  elif [[ "$REPAIR_ROOTER_PRESENT" != yes ]]; then
+    services_remove_owned_rooter_unit >/dev/null 2>&1 || true
+  fi
+  case "$REPAIR_IPV4_FORWARD" in
+    0|1) sysctl -w "net.ipv4.ip_forward=$REPAIR_IPV4_FORWARD" >/dev/null 2>&1 || true ;;
+  esac
+  if [[ "$REPAIR_ROUTING_SYSCTL_EXISTED" == no &&
+        -e "$ROUTING_SYSCTL_FILE" ]] &&
+     state_resource_owned routing-sysctl-file "$ROUTING_SYSCTL_FILE"; then
+    rm -f "$ROUTING_SYSCTL_FILE"
+    state_record_resource routing-sysctl-file "$ROUTING_SYSCTL_FILE" removed-after-repair-failure yes "" >/dev/null 2>&1 || true
+  fi
+  services_start_if_expected "$CAPE_SCHEDULER_SERVICE" "$REPAIR_CAPE_ACTIVE" >/dev/null 2>&1 || true
+
+  if [[ "$rc" -ne 0 ]]; then
+    DEPLOYMENT_PHASE=repair-incomplete
+    state_write_atomic >/dev/null 2>&1 || true
+    fail "Repair did not complete; runtime state was restored as far as possible"
+  fi
+  set -e
+  return "$rc"
+}
+
+trap 'rc=$?; repair_restore_runtime "$rc"; exit "$rc"' ERR
+trap 'repair_restore_runtime 130; exit 130' INT TERM
+
+for ((i=0;i<CAPE_TARGETS_COUNT;i++)); do
+  targets_bind "$i"
+  NORMAL_SNAPSHOT="${NORMAL_SNAPSHOT:-${CAPE_MACHINE_SNAPSHOT:-}}"
+  [[ -n "$NORMAL_SNAPSHOT" ]] || {
+    fail "Normal-route CAPE snapshot is unknown for $CAPE_MACHINE_SECTION/$DOMAIN"
+    exit 20
+  }
+  virsh snapshot-info "$DOMAIN" "$NORMAL_SNAPSHOT" >/dev/null 2>&1 || {
+    fail "Normal-route CAPE snapshot is missing for $CAPE_MACHINE_SECTION/$DOMAIN: $NORMAL_SNAPSHOT"
+    exit 20
+  }
+  if [[ -n "${FINAL_SNAPSHOT:-}" ]]; then
+    virsh snapshot-info "$DOMAIN" "$FINAL_SNAPSHOT" >/dev/null 2>&1 || {
+      fail "Preserved legacy/final snapshot is missing for $CAPE_MACHINE_SECTION/$DOMAIN; repair will not invent a replacement."
+      exit 20
+    }
+  fi
+  targets_capture_bound "$i"
+done
+targets_bind 0
+state_write_atomic
+
+DISCOVERY_ERRORS=()
+COMPAT_NOTES=()
+check_cape_layout
+[[ "$COMPAT_STATUS" == plan-compatible ]] || { fail "Current CAPE source layout is not repair-compatible"; exit 23; }
+
+# Repair may recreate missing AutoDeploy-owned infrastructure, but it must not
+# silently overwrite CAPE files changed by an operator or CAPE update after the
+# deployment committed them.
+cape_assert_owned_files_unchanged || {
+  fail "CAPE-managed files drifted after deployment; refusing repair overwrite. Inspect or rollback deliberately."
+  exit 26
+}
+
+# A legacy RC44 migration changes routing policy. Acquire the task/machine
+# maintenance guard before replacing the old permanent management-egress
+# firewall so no analysis can observe a half-migrated network policy.
+if [[ "$LEGACY_ROUTE_UPGRADE" == yes &&
+      ( "$REPAIR_CAPE_ACTIVE" == yes || "$REPAIR_PROCESSOR_ACTIVE" == yes ) ]]; then
+  cape_wait_and_acquire_maintenance "${REPAIR_WAIT_SECONDS:-3600}"
+  REPAIR_MAINTENANCE_ACQUIRED=yes
+fi
+
+# Non-disruptive recovery first.
+if ! virsh net-info "$ISOLATED_NETWORK_NAME" >/dev/null 2>&1; then
+  state_resource_owned libvirt-network "$ISOLATED_NETWORK_NAME" || { fail "Missing isolated network is not recorded as AutoDeploy-owned"; exit 21; }
+  isolated_network_apply
+fi
+
+firewall_apply
+
+if ! virsh dominfo "$INETSIM_DOMAIN_NAME" >/dev/null 2>&1; then
+  state_resource_owned domain "$INETSIM_DOMAIN_NAME" || { fail "Missing INetSim domain is not recorded as AutoDeploy-owned"; exit 22; }
+  artifact="$(appliance_fetch "$APPLIANCE_MANIFEST")"
+  [[ -e "$INETSIM_DISK_PATH" ]] || inetsim_copy_appliance_disk "$artifact"
+  inetsim_define_domain
+fi
+
+inetsim_configure_guest
+inetsim_verify_host
+
+# CAPE mutations happen only after CAPE reaches a task-safe point. A stopped
+# scheduler alone is not sufficient: cape-processor may still be reporting a
+# completed task. Acquire the database/machine maintenance guard whenever either
+# scheduler or processor is active. Only a fully stopped scheduler+processor
+# pair may skip the guard.
+if [[ "$REPAIR_MAINTENANCE_ACQUIRED" != yes &&
+      ( "$REPAIR_CAPE_ACTIVE" == yes || "$REPAIR_PROCESSOR_ACTIVE" == yes ) ]]; then
+  cape_wait_and_acquire_maintenance "${REPAIR_WAIT_SECONDS:-3600}"
+  REPAIR_MAINTENANCE_ACQUIRED=yes
+fi
+
+# The appliance is trusted infrastructure, but restarting it to activate a new
+# graphical console must still happen only while CAPE is at a task-safe point.
+inetsim_enable_gui_guest
+inetsim_verify_host
+
+DEPLOYMENT_PHASE=repairing
+state_write_atomic
+cape_configure_inetsim
+
+# CAPE's native route=inetsim path uses Rooter DNAT plus forwarding from the
+# analysis VM management bridge to the isolated INetSim bridge.
+routing_forwarding_apply
+services_prepare_route_control_plane
+cape_probe_inetsim_rooter_all
+
+extension_upgrade_route_gated
+
+validate_deployment_structural
+
+# Stop the scheduler before releasing DB maintenance locks so queued work can
+# never race the final service/configuration handoff.
+if [[ "$REPAIR_MAINTENANCE_ACQUIRED" == yes ]]; then
+  systemctl stop "$CAPE_SCHEDULER_SERVICE"
+  cape_release_maintenance
+  REPAIR_MAINTENANCE_ACQUIRED=no
+fi
+
+services_start_if_expected "${CAPE_PROCESSOR_SERVICE:-}" "$REPAIR_PROCESSOR_ACTIVE"
+services_start_if_expected "${CAPE_WEB_SERVICE:-}" "$REPAIR_WEB_ACTIVE"
+
+# Rooter is mandatory for a committed route=inetsim deployment and must
+# answer a real socket probe before the scheduler is released.
+services_prepare_route_control_plane
+
+services_start_if_expected "$CAPE_SCHEDULER_SERVICE" "$REPAIR_CAPE_ACTIVE"
+
+validate_deployment_services
+
+# A checksum-pinned release may repair an older committed deployment in place.
+# Promote provenance only after every migration/repair gate succeeds.
+if [[ -n "${CAPE_INETSIM_RELEASE_TAG:-}" ||
+      -n "${CAPE_INETSIM_RELEASE_SOURCE_BUNDLE:-}" ||
+      -n "${CAPE_INETSIM_RELEASE_SOURCE_SHA256:-}" ||
+      -n "${CAPE_INETSIM_RELEASE_SOURCE_COMMIT:-}" ]]; then
+  [[ -n "${CAPE_INETSIM_RELEASE_TAG:-}" &&
+     -n "${CAPE_INETSIM_RELEASE_SOURCE_BUNDLE:-}" &&
+     -n "${CAPE_INETSIM_RELEASE_SOURCE_SHA256:-}" &&
+     -n "${CAPE_INETSIM_RELEASE_SOURCE_COMMIT:-}" ]] || {
+    fail "Repair release provenance is incomplete; refusing to commit"
+    exit 27
+  }
+
+  PREVIOUS_RELEASE_TAG="${RELEASE_TAG:-development/unknown}"
+  RELEASE_TAG="$CAPE_INETSIM_RELEASE_TAG"
+  RELEASE_SOURCE_BUNDLE="$CAPE_INETSIM_RELEASE_SOURCE_BUNDLE"
+  RELEASE_SOURCE_SHA256="$CAPE_INETSIM_RELEASE_SOURCE_SHA256"
+  RELEASE_SOURCE_COMMIT="$CAPE_INETSIM_RELEASE_SOURCE_COMMIT"
+  state_record_resource repair-release "${PREVIOUS_RELEASE_TAG}->${RELEASE_TAG}" upgraded yes "route-separated-migration"
+  validate_release_provenance
+fi
+
+DEPLOYMENT_PHASE=handoff-complete
+state_write_atomic
+if [[ "${CAPE_INETSIM_E2E_REQUIRED:-yes}" != no ]]; then
+  "$AUTODEPLOY_ROOT/bin/cape-inetsim-selftest"
+else
+  warn "Automatic CAPE end-to-end self-test explicitly disabled by CAPE_INETSIM_E2E_REQUIRED=no"
+fi
+
+state_set_phase committed
+trap - ERR INT TERM
+pass "Safe task-aware repair completed with end-to-end route validation"
