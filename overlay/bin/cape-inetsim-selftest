@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${AUTODEPLOY_ROOT:-/usr/local/lib/cape-inetsim-autodeploy}"
+[[ -f "$ROOT/lib/state.sh" ]] || ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AUTODEPLOY_ROOT="$ROOT"
+export AUTODEPLOY_ROOT
+
+source "$ROOT/lib/common.sh"
+source "$ROOT/lib/targets.sh"
+source "$ROOT/lib/state.sh"
+source "$ROOT/lib/cape.sh"
+source "$ROOT/lib/cape-runtime.sh"
+source "$ROOT/lib/services.sh"
+
+require_root
+state_load || { fail "No committed AutoDeploy state exists"; exit 2; }
+[[ "${DEPLOYMENT_PHASE:-}" == committed || "${DEPLOYMENT_PHASE:-}" == handoff-complete ]] || {
+  fail "End-to-end self-test requires a deployed service handoff (phase=${DEPLOYMENT_PHASE:-unknown})"
+  exit 2
+}
+
+PERSISTED_ROOT="$CAPE_ROOT"
+DISCOVERY_ERRORS=()
+COMPAT_NOTES=()
+discover_cape_root
+[[ "$CAPE_ROOT" == "$PERSISTED_ROOT" ]] || { fail "Live CAPE root differs from deployment state"; exit 2; }
+discover_cape_services
+discover_cape_runtime
+services_validate_deployment_state
+
+CAPE_TARGETS_COUNT="$(targets_count)"
+((CAPE_TARGETS_COUNT > 0)) || { fail "No CAPE analysis targets are available"; exit 2; }
+targets_bind 0
+TEST_MACHINE="$CAPE_MACHINE_LABEL"
+TIMEOUT="${CAPE_INETSIM_E2E_TIMEOUT:-900}"
+TASK_TIMEOUT="${CAPE_INETSIM_E2E_TASK_TIMEOUT:-60}"
+[[ "$TIMEOUT" =~ ^[1-9][0-9]*$ ]] || TIMEOUT=900
+[[ "$TASK_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || TASK_TIMEOUT=60
+
+MARKER="autodeploy-$(date +%Y%m%d%H%M%S)-$(printf '%04x' "$((RANDOM % 65536))").test"
+WORK="$AD_GENERATED_ROOT/${DEPLOYMENT_ID}-e2e"
+mkdir -p "$WORK"
+chmod 0700 "$WORK"
+POS_SCRIPT="$WORK/positive.ps1"
+NEG_SCRIPT="$WORK/negative.ps1"
+RESULT="$AD_LOG_ROOT/${DEPLOYMENT_ID}-e2e-acceptance.json"
+
+cat >"$POS_SCRIPT" <<EOF
+\$ErrorActionPreference = 'SilentlyContinue'
+try { Resolve-DnsName '$MARKER' | Out-Null } catch {}
+try { Invoke-WebRequest -UseBasicParsing -Uri 'http://$MARKER/' -TimeoutSec 12 | Out-Null } catch {}
+Start-Sleep -Seconds 2
+EOF
+cat >"$NEG_SCRIPT" <<'EOF'
+$ErrorActionPreference = 'SilentlyContinue'
+try { Resolve-DnsName 'example.com' | Out-Null } catch {}
+try { Invoke-WebRequest -UseBasicParsing -Uri 'http://example.com/' -TimeoutSec 12 | Out-Null } catch {}
+Start-Sleep -Seconds 2
+EOF
+chmod 0644 "$POS_SCRIPT" "$NEG_SCRIPT"
+
+submit_ps1() {
+  local route="$1" script="$2" out tid
+  out="$(cape_run_as_user "$CAPE_SERVICE_USER" "$CAPE_RUNTIME_PYTHON" "$CAPE_ROOT/utils/submit.py" \
+      "$script" --package ps1 --route "$route" --machine "$TEST_MACHINE" --timeout "$TASK_TIMEOUT" 2>&1)" || {
+    printf '%s\n' "$out" >&2
+    return 1
+  }
+  tid="$(ad_python - "$out" <<'PY'
+import re,sys
+s=sys.argv[1]
+m=re.search(r'\bID\s+(\d+)\b',s)
+if not m:
+    m=re.search(r'\bIDs\s+\[\s*(\d+)',s)
+if not m:
+    raise SystemExit(1)
+print(m.group(1))
+PY
+)" || {
+    printf '%s\n' "$out" >&2
+    fail "Could not parse CAPE task ID from submission output"
+    return 1
+  }
+  printf '%s\n' "$tid"
+}
+
+task_status() {
+  local tid="$1"
+  cape_run_as_user "$CAPE_SERVICE_USER" "$CAPE_RUNTIME_PYTHON" - "$tid" <<'PY'
+import sys
+from lib.cuckoo.core.database import Database, init_database
+init_database()
+db=Database()
+with db.session.begin():
+    t=db.view_task(int(sys.argv[1]))
+    print(getattr(t,"status","missing") if t else "missing")
+PY
+}
+
+wait_task_reported() {
+  local tid="$1" elapsed=0 status=""
+  while ((elapsed < TIMEOUT)); do
+    status="$(task_status "$tid" 2>/dev/null | tail -1 || true)"
+    case "$status" in
+      reported) pass "CAPE self-test task $tid reached reported state"; return 0 ;;
+      failed_analysis|failed_processing|failed_reporting)
+        fail "CAPE self-test task $tid failed with status $status"; return 1 ;;
+    esac
+    sleep 10
+    elapsed=$((elapsed+10))
+  done
+  fail "Timed out waiting ${TIMEOUT}s for CAPE self-test task $tid (last status=${status:-unknown})"
+  return 1
+}
+
+internet_route_interface() {
+  ad_python - "$CAPE_ROOT/conf/routing.conf" <<'PY'
+import configparser,sys
+c=configparser.ConfigParser(interpolation=None,strict=False)
+c.read(sys.argv[1])
+v=c.get("routing","internet",fallback="none").strip()
+print("" if not v or v.lower()=="none" else v)
+PY
+}
+
+info "Submitting controlled benign PowerShell route=inetsim acceptance task on $TEST_MACHINE"
+POSITIVE_TASK="$(submit_ps1 inetsim "$POS_SCRIPT")"
+wait_task_reported "$POSITIVE_TASK"
+
+INTERNET_IFACE="$(internet_route_interface)"
+NEGATIVE_TASK=""
+if [[ -n "$INTERNET_IFACE" ]]; then
+  info "Submitting controlled benign route=internet separation task through discovered interface $INTERNET_IFACE"
+  NEGATIVE_TASK="$(submit_ps1 internet "$NEG_SCRIPT")"
+  wait_task_reported "$NEGATIVE_TASK"
+else
+  warn "CAPE route=internet is not configured on this host; Internet negative control is recorded as not-applicable"
+fi
+
+ARGS=(
+  --cape-root "$CAPE_ROOT"
+  --inetsim-ip "$INETSIM_IP"
+  --positive-task "$POSITIVE_TASK"
+  --marker "$MARKER"
+  --output "$RESULT"
+)
+[[ -n "$NEGATIVE_TASK" ]] && ARGS+=(--negative-task "$NEGATIVE_TASK")
+ad_python "$AUTODEPLOY_ROOT/tools/acceptance_reports.py" "${ARGS[@]}"
+
+# Extra hard gate: a successful positive task must contain a non-empty pcap,
+# at least one DNS event, and at least one HTTP event. This prevents a report
+# from passing on route metadata alone.
+ad_python - "$RESULT" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+p=d.get("positive") or {}
+s=p.get("summary") or {}
+if not p.get("capture_path"): raise SystemExit("positive task has no non-empty PCAP")
+if int(s.get("dns",0) or 0) < 1: raise SystemExit("positive task has no INetSim DNS events")
+if int(s.get("http",0) or 0) < 1: raise SystemExit("positive task has no INetSim HTTP events")
+PY
+
+state_record_resource e2e-selftest "$POSITIVE_TASK" passed yes "route=inetsim marker=$MARKER report=$RESULT"
+if [[ -n "$NEGATIVE_TASK" ]]; then
+  state_record_resource e2e-selftest "$NEGATIVE_TASK" passed yes "route=internet separation-control report=$RESULT"
+else
+  state_record_resource e2e-selftest route-internet not-configured no "routing.internet=none"
+fi
+state_write_atomic
+
+pass "CAPE end-to-end route=inetsim acceptance passed: DNS + HTTP + PCAP + reported analysis"
+if [[ -n "$NEGATIVE_TASK" ]]; then
+  pass "CAPE route=internet separation control passed with no INetSim attribution"
+fi
+kv "acceptance report:" "$RESULT"
