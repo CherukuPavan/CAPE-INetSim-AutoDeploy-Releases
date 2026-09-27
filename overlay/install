@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# This file is the source-bundle entry point. Network bootstrap is handled only
+# by the checksum-pinned versioned GitHub Release 'install' asset.
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+SCRIPT_DIR=""
+if [[ -n "$SCRIPT_SOURCE" && -e "$SCRIPT_SOURCE" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" 2>/dev/null && pwd || true)"
+fi
+
+if [[ -z "$SCRIPT_DIR" || ! -f "$SCRIPT_DIR/lib/common.sh" ]]; then
+  cat >&2 <<'EOF'
+[FAIL] This repository entry point is not a trusted network bootstrap.
+Use the versioned GitHub Release 'install' asset, which checksum-verifies an
+immutable source bundle before executing this installer.
+EOF
+  exit 2
+fi
+
+AUTODEPLOY_ROOT="$SCRIPT_DIR"
+export AUTODEPLOY_ROOT
+
+source "$AUTODEPLOY_ROOT/lib/common.sh"
+source "$AUTODEPLOY_ROOT/lib/targets.sh"
+source "$AUTODEPLOY_ROOT/lib/state.sh"
+source "$AUTODEPLOY_ROOT/lib/transaction.sh"
+source "$AUTODEPLOY_ROOT/lib/cape.sh"
+source "$AUTODEPLOY_ROOT/lib/libvirt.sh"
+source "$AUTODEPLOY_ROOT/lib/windows.sh"
+source "$AUTODEPLOY_ROOT/lib/qga.sh"
+source "$AUTODEPLOY_ROOT/lib/windows-winrm.sh"
+source "$AUTODEPLOY_ROOT/lib/windows-cape-agent.sh"
+source "$AUTODEPLOY_ROOT/lib/windows-qga.sh"
+source "$AUTODEPLOY_ROOT/lib/windows-control.sh"
+source "$AUTODEPLOY_ROOT/lib/windows-network-guard.sh"
+source "$AUTODEPLOY_ROOT/lib/windows-management-dhcp.sh"
+source "$AUTODEPLOY_ROOT/lib/windows-vm.sh"
+source "$AUTODEPLOY_ROOT/lib/network.sh"
+source "$AUTODEPLOY_ROOT/lib/compat.sh"
+source "$AUTODEPLOY_ROOT/lib/plan.sh"
+source "$AUTODEPLOY_ROOT/lib/decision.sh"
+source "$AUTODEPLOY_ROOT/lib/inventory.sh"
+source "$AUTODEPLOY_ROOT/lib/appliance.sh"
+source "$AUTODEPLOY_ROOT/lib/isolated-network.sh"
+source "$AUTODEPLOY_ROOT/lib/firewall.sh"
+source "$AUTODEPLOY_ROOT/lib/inetsim-vm.sh"
+source "$AUTODEPLOY_ROOT/lib/cape-configure.sh"
+source "$AUTODEPLOY_ROOT/lib/extension.sh"
+source "$AUTODEPLOY_ROOT/lib/services.sh"
+source "$AUTODEPLOY_ROOT/lib/maintenance.sh"
+source "$AUTODEPLOY_ROOT/lib/validate.sh"
+source "$AUTODEPLOY_ROOT/lib/rollback.sh"
+source "$AUTODEPLOY_ROOT/lib/deploy.sh"
+
+MODE="deploy"
+REQUESTED_MACHINE=""
+ROLLBACK_APPLY=no
+ACCEPT_POSITIVE_TASK=""
+ACCEPT_NEGATIVE_TASK=""
+ACCEPT_MARKER=""
+
+usage(){
+  cat <<EOF
+${AD_NAME} ${AD_VERSION}
+
+Usage:
+  sudo ./install [--deploy] [--machine CAPE_MACHINE] [--wait-seconds N]
+  sudo ./install --plan [--machine CAPE_MACHINE]
+
+With no --machine override, AutoDeploy configures every enabled Windows-compatible
+CAPE analysis VM that can be mapped safely to libvirt.
+  sudo ./install --verify
+  sudo ./install --repair
+  sudo ./install --status
+  sudo ./install --collect
+  sudo ./install --acceptance --positive-task ID --negative-task ID --marker UNIQUE_HOST
+  sudo ./install --rollback [--apply]
+
+With no mode argument, AutoDeploy performs --deploy.
+
+Safety:
+  --plan       read-only discovery; changes nothing.
+  --deploy     transactional deployment; stops on unknown CAPE layouts and
+               rolls back project-owned changes on failure.
+  --collect    create one comprehensive read-only diagnostic .tar.gz for support/research.
+  --acceptance validate completed route=inetsim positive / route=internet negative task evidence read-only.
+  --rollback   dry-run recovery plan unless --apply is also supplied.
+
+Per-task routing is authoritative: internet uses CAPE's configured Internet path,\ninetsim uses the isolated fake-Internet appliance, and none/drop remain blocked.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --deploy) MODE=deploy; shift ;;
+    --plan) MODE=plan; shift ;;
+    --verify) MODE=verify; shift ;;
+    --repair) MODE=repair; shift ;;
+    --status) MODE=status; shift ;;
+    --collect) MODE=collect; shift ;;
+    --acceptance) MODE=acceptance; shift ;;
+    --positive-task)
+      [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--positive-task requires an integer" >&2; exit 2; }
+      ACCEPT_POSITIVE_TASK="$2"; shift 2 ;;
+    --negative-task)
+      [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--negative-task requires an integer" >&2; exit 2; }
+      ACCEPT_NEGATIVE_TASK="$2"; shift 2 ;;
+    --marker)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--marker requires a non-empty unique hostname" >&2; exit 2; }
+      ACCEPT_MARKER="$2"; shift 2 ;;
+    --rollback) MODE=rollback; shift ;;
+    --apply) ROLLBACK_APPLY=yes; shift ;;
+    --machine)
+      [[ $# -ge 2 ]] || { echo "--machine requires a value" >&2; exit 2; }
+      REQUESTED_MACHINE="$2"; shift 2 ;;
+    --wait-seconds)
+      [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--wait-seconds requires an integer" >&2; exit 2; }
+      DEPLOY_WAIT_SECONDS="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# The INetSim appliance console is bound to localhost-only SPICE and SSH
+# password authentication is disabled. Keep a deterministic lab-console
+# credential so a fresh random host needs no second setup step.
+if [[ "$MODE" == deploy || "$MODE" == repair ]]; then
+  CAPE_INETSIM_GUI_PASSWORD="${CAPE_INETSIM_GUI_PASSWORD:-123}"
+  export CAPE_INETSIM_GUI_PASSWORD
+fi
+
+case "$MODE" in
+  plan)
+    require_root_for_plan
+    run_discovery
+    deployment_decision_classify
+    print_plan
+    if ((${#DISCOVERY_ERRORS[@]})); then exit 10; fi
+    case "${COMPAT_STATUS:-blocked}" in
+      blocked) exit 11 ;;
+      plan-only-unknown-cape-layout) exit 12 ;;
+    esac
+    ;;
+  deploy)
+    deploy_run
+    ;;
+  verify)
+    require_root
+    exec "$AUTODEPLOY_ROOT/bin/cape-inetsim-verify"
+    ;;
+  repair)
+    require_root
+    exec "$AUTODEPLOY_ROOT/bin/cape-inetsim-repair"
+    ;;
+  status)
+    require_root
+    exec "$AUTODEPLOY_ROOT/bin/cape-inetsim-status"
+    ;;
+  collect)
+    exec bash "$AUTODEPLOY_ROOT/bin/cape-inetsim-collect"
+    ;;
+  acceptance)
+    args=()
+    [[ -n "$ACCEPT_POSITIVE_TASK" ]] && args+=(--positive-task "$ACCEPT_POSITIVE_TASK")
+    [[ -n "$ACCEPT_NEGATIVE_TASK" ]] && args+=(--negative-task "$ACCEPT_NEGATIVE_TASK")
+    [[ -n "$ACCEPT_MARKER" ]] && args+=(--marker "$ACCEPT_MARKER")
+    exec bash "$AUTODEPLOY_ROOT/bin/cape-inetsim-acceptance" "${args[@]}"
+    ;;
+  rollback)
+    require_root
+    if [[ "$ROLLBACK_APPLY" != yes ]]; then
+      exec "$AUTODEPLOY_ROOT/bin/cape-inetsim-rollback"
+    fi
+    transaction_lock_acquire
+    state_load || { fail "No deployment state exists"; exit 1; }
+    echo "Rollback will restore the pre-deployment Windows snapshot/CAPE files and remove only AutoDeploy-owned VM/network resources."
+    autodeploy_rollback_internal
+    ;;
+esac
