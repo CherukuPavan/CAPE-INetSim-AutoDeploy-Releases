@@ -1,0 +1,20 @@
+name: Public runner validation
+
+on:
+  push:
+    branches:
+      - staging/public-runner-validation
+
+permissions:
+  contents: read
+
+jobs:
+  validate-runner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Prove runner starts
+        run: |
+          set -Eeuo pipefail
+          echo "PUBLIC_RUNNER_OK"
+          uname -a
