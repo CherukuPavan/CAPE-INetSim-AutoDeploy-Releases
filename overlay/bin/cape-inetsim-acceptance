@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="${AUTODEPLOY_ROOT:-/usr/local/lib/cape-inetsim-autodeploy}"
+[[ -f "$ROOT/lib/state.sh" ]] || ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AUTODEPLOY_ROOT="$ROOT"
+export AUTODEPLOY_ROOT
+
+source "$ROOT/lib/common.sh"
+source "$ROOT/lib/targets.sh"
+source "$ROOT/lib/state.sh"
+
+# Keep acceptance independent of shell-function inheritance and fixed Python
+# paths. Resolve the same host interpreter contract locally and execute it
+# directly for every report/PCAP helper.
+ACCEPTANCE_PYTHON="${AD_HOST_PYTHON:-}"
+if [[ -z "$ACCEPTANCE_PYTHON" || ! -x "$ACCEPTANCE_PYTHON" ]]; then
+  ACCEPTANCE_PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+fi
+[[ -n "$ACCEPTANCE_PYTHON" && -x "$ACCEPTANCE_PYTHON" ]] || {
+  fail "No supported host Python interpreter is available for functional acceptance"
+  exit 127
+}
+acceptance_python(){ "$ACCEPTANCE_PYTHON" "$@"; }
+
+POSITIVE_TASK=""
+NEGATIVE_TASK=""
+MARKER=""
+OUTPUT=""
+
+usage(){
+  cat <<EOF
+Usage:
+  sudo ./install --acceptance --positive-task ID --negative-task ID --marker UNIQUE_HOST
+
+This is read-only with respect to CAPE, libvirt, Windows and networking.
+It validates a controlled route=inetsim / route=internet task pair already completed on the host.
+The positive route=inetsim report must contain the exact unique marker and
+INetSim context. Its packet capture must contain that marker in traffic to/from
+INetSim. The negative route=internet task must contain neither the marker nor
+any traffic to/from the INetSim endpoint.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --positive-task)
+      [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--positive-task requires an integer" >&2; exit 2; }
+      POSITIVE_TASK="$2"; shift 2 ;;
+    --negative-task)
+      [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "--negative-task requires an integer" >&2; exit 2; }
+      NEGATIVE_TASK="$2"; shift 2 ;;
+    --marker)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--marker requires a non-empty unique hostname" >&2; exit 2; }
+      MARKER="$2"; shift 2 ;;
+    --output)
+      [[ $# -ge 2 ]] || { echo "--output requires a path" >&2; exit 2; }
+      OUTPUT="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "$POSITIVE_TASK" && -n "$NEGATIVE_TASK" && -n "$MARKER" ]] || {
+  fail "Functional acceptance requires --positive-task, --negative-task and --marker"
+  usage >&2
+  exit 2
+}
+
+require_root
+state_load || { fail "No deployment state exists"; exit 1; }
+[[ "${DEPLOYMENT_PHASE:-}" == committed ]] || {
+  fail "Functional acceptance requires a committed deployment (current phase: ${DEPLOYMENT_PHASE:-unknown})"
+  exit 1
+}
+
+bash "$ROOT/bin/cape-inetsim-verify"
+
+install -d -m 0700 "$AD_LOG_ROOT"
+[[ -n "$OUTPUT" ]] || OUTPUT="$AD_LOG_ROOT/${DEPLOYMENT_ID}-functional-acceptance.json"
+
+acceptance_python "$ROOT/tools/acceptance_reports.py"   --cape-root "$CAPE_ROOT"   --inetsim-ip "$INETSIM_IP"   --positive-task "$POSITIVE_TASK"   --negative-task "$NEGATIVE_TASK"   --marker "$MARKER"   --output "$OUTPUT"
+
+acceptance_capture_path() {
+  local role
+  role="$1"
+  acceptance_python - "$OUTPUT" "$role" <<'PY'
+import json
+import pathlib
+import sys
+
+path, role = sys.argv[1:]
+data = json.loads(pathlib.Path(path).read_text())
+capture = str((data.get(role) or {}).get("capture_path") or "").strip()
+if not capture:
+    raise SystemExit(1)
+print(capture)
+PY
+}
+
+POS_PCAP="$(acceptance_capture_path positive)" || {
+  fail "Positive task $POSITIVE_TASK has no non-empty local CAPE packet capture"
+  exit 21
+}
+NEG_PCAP="$(acceptance_capture_path negative)" || {
+  fail "Negative task $NEGATIVE_TASK has no non-empty local CAPE packet capture"
+  exit 22
+}
+
+[[ -s "$POS_PCAP" ]] || {
+  fail "Positive task $POSITIVE_TASK capture selected by report validation is missing or empty: $POS_PCAP"
+  exit 21
+}
+[[ -s "$NEG_PCAP" ]] || {
+  fail "Negative task $NEGATIVE_TASK capture selected by report validation is missing or empty: $NEG_PCAP"
+  exit 22
+}
+
+have tcpdump || { fail "tcpdump is required for functional packet-capture acceptance"; exit 23; }
+
+pcap_has_inetsim() {
+  timeout 15 tcpdump -nn -r "$1" -c 1 "host $INETSIM_IP" >/dev/null 2>&1
+}
+
+pcap_has_marker() {
+  timeout 15 tcpdump -nn -vvv -A -s 0 -r "$1" "host $INETSIM_IP" 2>/dev/null |
+    awk -v marker="$MARKER" '
+      BEGIN { marker=tolower(marker); found=0 }
+      index(tolower($0), marker) { found=1 }
+      END { exit(found ? 0 : 1) }
+    '
+}
+
+pcap_has_inetsim "$POS_PCAP" || {
+  fail "Positive task $POSITIVE_TASK has no packet-capture traffic for $INETSIM_IP"
+  exit 24
+}
+
+pcap_has_marker "$POS_PCAP" || {
+  fail "Positive task $POSITIVE_TASK packet capture does not contain acceptance marker $MARKER"
+  exit 25
+}
+
+if pcap_has_marker "$NEG_PCAP"; then
+  fail "Internet-route task $NEGATIVE_TASK unexpectedly contains acceptance marker $MARKER"
+  exit 26
+fi
+
+if pcap_has_inetsim "$NEG_PCAP"; then
+  fail "Internet-route task $NEGATIVE_TASK unexpectedly contains INetSim traffic"
+  exit 28
+fi
+
+NEG_HAS_INETSIM=false
+
+grep -Rqs 'CAPE_INETSIM_VM_ROUTE_GATED_V2' "$CAPE_ROOT/web" || {
+  fail "Installed route-gated INetSim extension marker is missing"
+  exit 27
+}
+
+acceptance_python - "$OUTPUT" "$POS_PCAP" "$NEG_PCAP" "$MARKER" "$NEG_HAS_INETSIM" "${RELEASE_TAG:-}" "${RELEASE_SOURCE_COMMIT:-}" "${RELEASE_SOURCE_SHA256:-}" <<'PY'
+import json,pathlib,sys
+path,pos,neg,marker,neg_has_inetsim,release_tag,release_commit,release_sha=sys.argv[1:]
+p=pathlib.Path(path)
+d=json.loads(p.read_text())
+d["pcap_validation"]={
+    "positive_capture":pos,
+    "positive_contains_inetsim_ip":True,
+    "positive_contains_marker":True,
+    "negative_capture":neg,
+    "negative_contains_marker":False,
+    "negative_contains_inetsim_ip":neg_has_inetsim.lower()=="true",
+    "background_inetsim_allowed_in_negative":False,
+}
+d["release_validation"]={
+    "manifest_and_structural_verification":"PASS",
+    "recovery_assets":"PASS",
+    "release_tag":release_tag or None,
+    "release_source_commit":release_commit or None,
+    "release_source_sha256":release_sha or None,
+}
+d["marker"]=marker
+d["status"]="pass"
+p.write_text(json.dumps(d,indent=2)+"\n")
+PY
+
+pass "Per-task INetSim/Internet route-separation acceptance passed"
+pass "Positive PCAP proved marker-to-INetSim linkage independently of CAPE report field shape"
+kv "positive task:" "$POSITIVE_TASK"
+kv "negative task:" "$NEGATIVE_TASK"
+kv "marker:" "$MARKER"
+kv "acceptance evidence:" "$OUTPUT"
