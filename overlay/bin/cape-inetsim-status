@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="${AUTODEPLOY_ROOT:-/usr/local/lib/cape-inetsim-autodeploy}"
+[[ -f "$ROOT/lib/state.sh" ]] || ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AUTODEPLOY_ROOT="$ROOT"
+export AUTODEPLOY_ROOT
+source "$ROOT/lib/common.sh"
+source "$ROOT/lib/targets.sh"
+source "$ROOT/lib/state.sh"
+source "$ROOT/lib/services.sh"
+
+require_root
+state_load || { echo "CAPE-INetSim-AutoDeploy: not deployed (no state file at $AD_STATE_FILE)"; exit 1; }
+
+domain_state(){ virsh domstate "$1" 2>/dev/null | head -1 | xargs || echo absent; }
+network_state(){ virsh net-info "$1" >/dev/null 2>&1 && virsh net-info "$1" | awk -F: '/^Active:/{gsub(/^[ \t]+/,"",$2);print $2}' || echo absent; }
+snapshot_state(){ [[ -n "$2" ]] && virsh snapshot-info "$1" "$2" >/dev/null 2>&1 && virsh snapshot-info "$1" "$2" | awk -F: '/^State:/{gsub(/^[ \t]+/,"",$2);print $2}' || echo absent; }
+
+echo "CAPE-INetSim-AutoDeploy status"
+kv "version:" "$AD_VERSION"
+kv "deployment id:" "${DEPLOYMENT_ID:-unknown}"
+kv "phase:" "${DEPLOYMENT_PHASE:-unknown}"
+kv "CAPE root:" "${CAPE_ROOT:-unknown}"
+kv "CAPE commit:" "${CAPE_COMMIT:-unknown}"
+kv "release tag:" "${RELEASE_TAG:-development/unknown}"
+kv "release source commit:" "${RELEASE_SOURCE_COMMIT:-development/unknown}"
+kv "release source SHA256:" "${RELEASE_SOURCE_SHA256:-development/unknown}"
+kv "managed CAPE machines:" "${CAPE_TARGETS_COUNT:-0}"
+echo "Analysis VM targets:"
+ad_python - "${CAPE_TARGETS_JSON:-[]}" <<'PY'
+import json,sys
+try: a=json.loads(sys.argv[1])
+except Exception: a=[]
+for d in a:
+    print("  - {section} -> {domain} | mgmt={ip} | fake={fake} | phase={phase} | final={final}".format(
+        section=d.get("section","?"),domain=d.get("domain","?"),ip=d.get("ip","?"),
+        fake=d.get("fake_ip","?"),phase=d.get("phase","?"),final=d.get("final_snapshot") or "none"))
+PY
+kv "isolated subnet:" "${ISOLATED_SUBNET:-unknown}"
+kv "isolated network:" "${ISOLATED_NETWORK_NAME:-unknown}"
+kv "isolated network active:" "$(network_state "${ISOLATED_NETWORK_NAME:-}")"
+kv "capture bridge:" "${ISOLATED_BRIDGE_NAME:-unknown}"
+kv "INetSim domain:" "${INETSIM_DOMAIN_NAME:-unknown}"
+kv "INetSim VM state:" "$(domain_state "${INETSIM_DOMAIN_NAME:-}")"
+kv "INetSim IP:" "${INETSIM_IP:-unknown}"
+kv "Windows fake IP:" "${WINDOWS_FAKE_IP:-unknown}"
+kv "scheduler service:" "${CAPE_SCHEDULER_SERVICE:-unknown} ($(systemctl is-active "${CAPE_SCHEDULER_SERVICE:-__missing__}" 2>/dev/null || true))"
+kv "processor service:" "${CAPE_PROCESSOR_SERVICE:-none} $( [[ -n "${CAPE_PROCESSOR_SERVICE:-}" ]] && systemctl is-active "$CAPE_PROCESSOR_SERVICE" 2>/dev/null || true )"
+kv "web service:" "${CAPE_WEB_SERVICE:-none} $( [[ -n "${CAPE_WEB_SERVICE:-}" ]] && systemctl is-active "$CAPE_WEB_SERVICE" 2>/dev/null || true )"
+kv "rooter service:" "${CAPE_ROOTER_SERVICE:-none} $( [[ -n "${CAPE_ROOTER_SERVICE:-}" ]] && systemctl is-active "$CAPE_ROOTER_SERVICE" 2>/dev/null || true )"
+kv "rooter socket:" "$(services_rooter_socket_path 2>/dev/null || echo unknown)"
+kv "CAPE Python:" "${CAPE_RUNTIME_PYTHON:-unknown}"
+
+if [[ -n "${DEPLOYMENT_ID:-}" && -f "$AD_LOG_ROOT/${DEPLOYMENT_ID}-functional-acceptance.json" ]]; then
+  ACCEPTANCE_STATUS="$(ad_python - "$AD_LOG_ROOT/${DEPLOYMENT_ID}-functional-acceptance.json" <<'PY'
+import json,sys
+try: print(json.load(open(sys.argv[1])).get("status","unknown"))
+except Exception: print("invalid")
+PY
+)"
+  kv "functional acceptance:" "$ACCEPTANCE_STATUS"
+else
+  kv "functional acceptance:" "not yet recorded"
+fi
