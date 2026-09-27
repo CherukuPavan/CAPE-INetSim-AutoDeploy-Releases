@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${AUTODEPLOY_ROOT:-/usr/local/lib/cape-inetsim-autodeploy}"
+[[ -f "$ROOT/lib/state.sh" ]] || ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AUTODEPLOY_ROOT="$ROOT"
+export AUTODEPLOY_ROOT
+
+source "$ROOT/lib/common.sh"
+source "$ROOT/lib/targets.sh"
+source "$ROOT/lib/state.sh"
+source "$ROOT/lib/cape.sh"
+source "$ROOT/lib/cape-runtime.sh"
+source "$ROOT/lib/qga.sh"
+source "$ROOT/lib/windows-management-dhcp.sh"
+source "$ROOT/lib/appliance.sh"
+source "$ROOT/lib/windows-network-guard.sh"
+source "$ROOT/lib/isolated-network.sh"
+source "$ROOT/lib/firewall.sh"
+source "$ROOT/lib/inetsim-vm.sh"
+source "$ROOT/lib/extension.sh"
+source "$ROOT/lib/services.sh"
+source "$ROOT/lib/validate.sh"
+
+require_root
+state_load || { fail "No deployment state exists"; exit 1; }
+if [[ -z "${CAPE_SCHEDULER_SERVICE:-}" || -z "${CAPE_ROOTER_EXECUTABLE:-}" ]]; then
+  discover_cape_services
+  discover_cape_runtime || true
+fi
+validate_deployment_structural
+validate_deployment_services
+pass "Deployment verification passed"
