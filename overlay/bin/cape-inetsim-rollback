@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${AUTODEPLOY_ROOT:-/usr/local/lib/cape-inetsim-autodeploy}"
+[[ -f "$ROOT/lib/state.sh" ]] || ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AUTODEPLOY_ROOT="$ROOT"
+export AUTODEPLOY_ROOT
+
+source "$ROOT/lib/common.sh"
+source "$ROOT/lib/targets.sh"
+source "$ROOT/lib/state.sh"
+source "$ROOT/lib/transaction.sh"
+source "$ROOT/lib/cape.sh"
+source "$ROOT/lib/cape-runtime.sh"
+source "$ROOT/lib/qga.sh"
+source "$ROOT/lib/windows-network-guard.sh"
+source "$ROOT/lib/windows-vm.sh"
+source "$ROOT/lib/isolated-network.sh"
+source "$ROOT/lib/firewall.sh"
+source "$ROOT/lib/inetsim-vm.sh"
+source "$ROOT/lib/cape-configure.sh"
+source "$ROOT/lib/appliance.sh"
+source "$ROOT/lib/extension.sh"
+source "$ROOT/lib/services.sh"
+source "$ROOT/lib/maintenance.sh"
+source "$ROOT/lib/rollback.sh"
+
+MODE=dry-run
+[[ "${1:-}" == "--apply" ]] && MODE=apply
+require_root
+state_load || { fail "No deployment state exists"; exit 1; }
+
+echo "Rollback plan for deployment $DEPLOYMENT_ID"
+kv "phase:" "${DEPLOYMENT_PHASE:-unknown}"
+ad_python - "${CAPE_TARGETS_JSON:-[]}" <<'PY'
+import json,sys
+try: a=json.loads(sys.argv[1])
+except Exception: a=[]
+for d in a:
+    if d.get("safety_snapshot") or d.get("isolated_mac"):
+        print(f"  - restore Windows domain '{d.get('domain','?')}' from deployment-owned safety state")
+PY
+state_has_owned_kind cape-file && echo "  - restore backed-up CAPE configuration/source files"
+state_has_owned_kind extension && echo "  - restore extension-protected CAPE web files"
+state_has_owned_kind domain && echo "  - remove AutoDeploy-owned INetSim VM"
+state_has_owned_kind disk && echo "  - remove AutoDeploy-owned INetSim disk"
+state_has_owned_kind libvirt-network && echo "  - remove AutoDeploy-owned isolated libvirt network"
+echo "  - restore original CAPE service states"
+
+if [[ "$MODE" == dry-run ]]; then
+  echo
+  echo "DRY RUN ONLY. No system configuration was changed."
+  echo "Apply with: sudo ./install --rollback --apply"
+  exit 0
+fi
+
+transaction_lock_acquire
+autodeploy_rollback_internal
