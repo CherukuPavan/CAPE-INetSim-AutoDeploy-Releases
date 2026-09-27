@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Comprehensive READ-ONLY research collector for CAPE-INetSim-AutoDeploy.
+# It reads host/CAPE/libvirt/Windows-management state and writes one tar.gz.
+# It does NOT create/edit/delete/restart/stop VMs, networks, snapshots, CAPE files,
+# Windows settings, firewall rules, or services.
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HOST="$(hostname -s 2>/dev/null || hostname)"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+OUTPUT_USER="${SUDO_USER:-$(id -un)}"
+if [[ "$OUTPUT_USER" != root ]]; then
+  OUTPUT_HOME="$(getent passwd "$OUTPUT_USER" | awk -F: '{print $6}')"
+else
+  OUTPUT_HOME="${HOME:-/root}"
+fi
+[[ -n "$OUTPUT_HOME" && -d "$OUTPUT_HOME" ]] || { echo "[FAIL] Could not determine output home directory" >&2; exit 2; }
+OUT_BASE="${CAPE_INETSIM_COLLECT_DIR:-$OUTPUT_HOME}"
+OUT="$OUT_BASE/${HOST}_AUTODEPLOY_DEEP_INVENTORY_${TS}"
+ARCHIVE="${OUT}.tar.gz"
+
+mkdir -p "$OUT"/{host,network,libvirt,cape,windows,packages,tests,autodeploy}
+if [[ "$(id -u)" -ne 0 ]]; then sudo -v; fi
+
+# Always inspect the system libvirt instance used by CAPE, never the caller's
+# qemu:///session instance. Defining/exporting this wrapper also makes runsh()
+# child shells use the same authoritative URI.
+virsh() {
+  sudo /usr/bin/virsh -c qemu:///system "$@"
+}
+export -f virsh
+
+run() {
+  local rel="$1"; shift
+  mkdir -p "$(dirname "$OUT/$rel.txt")"
+  {
+    echo "COMMAND: $*"
+    echo "TIME: $(date -Is)"
+    echo "------------------------------------------------------------"
+    set +e
+    "$@"
+    rc=$?
+    set -e
+    echo
+    echo "EXIT_CODE=$rc"
+  } >"$OUT/$rel.txt" 2>&1
+}
+
+runsh() {
+  local rel="$1"; shift
+  local cmd="$*"
+  mkdir -p "$(dirname "$OUT/$rel.txt")"
+  {
+    echo "COMMAND: $cmd"
+    echo "TIME: $(date -Is)"
+    echo "------------------------------------------------------------"
+    set +e
+    bash -lc "$cmd"
+    rc=$?
+    set -e
+    echo
+    echo "EXIT_CODE=$rc"
+  } >"$OUT/$rel.txt" 2>&1
+}
+
+redact_conf() {
+  local src="$1" dst="$2"
+  python3 - "$src" "$dst" <<'PY'
+import re,sys
+src,dst=sys.argv[1:3]
+sensitive=re.compile(r'(?i)(^|[^a-z0-9_])(password|passwd|secret|token|key|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret|proxy[_-]?password)([^a-z0-9_]|$)')
+urlcred=re.compile(r'([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@')
+with open(src,'r',errors='replace') as f, open(dst,'w') as o:
+    for line in f:
+        line=urlcred.sub(r'\1***REDACTED***@', line)
+        if sensitive.search(line):
+            if '=' in line:
+                o.write(line.split('=',1)[0] + '=***REDACTED***\n')
+            elif ':' in line:
+                o.write(line.split(':',1)[0] + ': ***REDACTED***\n')
+            else:
+                o.write('***REDACTED_SENSITIVE_LINE***\n')
+        else:
+            o.write(line)
+PY
+}
+
+{
+  echo "collector=CAPE-INetSim-AutoDeploy deep inventory"
+  echo "time=$(date -Is)"
+  echo "hostname=$HOST"
+  echo "user=$(id -un)"
+  echo "uid=$(id -u)"
+  echo "repo_root=$ROOT"
+  echo -n "repo_commit="
+  git -C "$ROOT" rev-parse HEAD 2>/dev/null || true
+} >"$OUT/README.txt"
+
+
+# AutoDeploy transaction evidence. Only state/ledger and diagnostic/result logs
+# are collected; callback commands/tokens and credential sources are excluded.
+AD_STATE_ROOT_CAPTURE="/var/lib/cape-inetsim-autodeploy"
+if [[ -f "$AD_STATE_ROOT_CAPTURE/state.env" ]]; then
+  redact_conf "$AD_STATE_ROOT_CAPTURE/state.env" "$OUT/autodeploy/state.redacted.txt"
+fi
+if [[ -f "$AD_STATE_ROOT_CAPTURE/resources.tsv" ]]; then
+  redact_conf "$AD_STATE_ROOT_CAPTURE/resources.tsv" "$OUT/autodeploy/resources.redacted.txt"
+fi
+for ext in "$AD_STATE_ROOT_CAPTURE"/extension-v*; do
+  [[ -d "$ext" ]] || continue
+  safe="$(basename "$ext" | tr -cs 'A-Za-z0-9._-' '_')"
+  {
+    echo "path=$ext"
+    echo "version=$(cat "$ext/VERSION" 2>/dev/null || true)"
+    echo "installed_backup=$(cat "$ext/.installed_backup" 2>/dev/null || true)"
+    echo "last_backup=$(cat "$ext/.last_backup" 2>/dev/null || true)"
+    if [[ -s "$ext/RUNTIME-SHA256SUMS" ]]; then
+      (cd "$ext" && sha256sum -c RUNTIME-SHA256SUMS) 2>&1 || true
+    fi
+  } >"$OUT/autodeploy/${safe}-runtime.txt"
+  if [[ -f "$ext/src/inetsim-vm.conf" ]]; then
+    redact_conf "$ext/src/inetsim-vm.conf" "$OUT/autodeploy/${safe}-config.redacted.txt"
+  fi
+done
+
+if [[ -d "$AD_STATE_ROOT_CAPTURE/logs" ]]; then
+  find "$AD_STATE_ROOT_CAPTURE/logs" -maxdepth 1 -type f \( \
+      -name '*diagnostics*.txt' -o \
+      -name '*inetsim-guest-configure.log' -o \
+      -name '*inetsim-host-verify.log' -o \
+      -name '*cape-maintenance.log' -o \
+      -name '*cape-runtime-preflight.log' -o \
+      -name '*cape-resultserver-readiness.log' -o \
+      -name '*windows-result.json' -o \
+      -name '*windows-verify.json' -o \
+      -name '*windows-isolated-control-stage.json' -o \
+      -name '*cape-agent-execpy.json' -o \
+      -name '*cape-agent-execpy.txt' -o \
+      -name '*progress.txt' -o \
+      -name '*windows-finalize*.json' -o \
+      -name '*windows-finalize*.txt' -o \
+      -name '*poweroff*.json' -o \
+      -name '*poweroff*.txt' -o \
+      -name '*extension-*.log' \
+    \) -print0 2>/dev/null |
+  while IFS= read -r -d '' src; do
+    cp -a "$src" "$OUT/autodeploy/$(basename "$src")"
+  done
+fi
+if [[ -f /var/log/libvirt/qemu/cape-inetsim-appliance.log ]]; then
+  tail -n 500 /var/log/libvirt/qemu/cape-inetsim-appliance.log >"$OUT/libvirt/cape-inetsim-appliance-qemu.log" 2>&1 || true
+fi
+journalctl -u virtnwfilterd.service -u virtnwfilterd.socket -u virtqemud.service -u libvirtd.service -n 400 --no-pager \
+  >"$OUT/libvirt/journal-runtime.txt" 2>&1 || true
+
+# Development bundles include self-tests; stripped public runtime bundles may
+# intentionally omit them. Planning remains available in both distributions.
+if [[ -x "$ROOT/tests/syntax.sh" ]]; then
+  run "tests/syntax" bash "$ROOT/tests/syntax.sh"
+else
+  printf 'SKIPPED: development self-test not shipped in runtime-only release\n' >"$OUT/tests/syntax.txt"
+fi
+if [[ -x "$ROOT/tests/universal_logic.sh" ]]; then
+  run "tests/universal_logic" bash "$ROOT/tests/universal_logic.sh"
+else
+  printf 'SKIPPED: development self-test not shipped in runtime-only release\n' >"$OUT/tests/universal_logic.txt"
+fi
+{
+  set +e
+  sudo "$ROOT/install" --plan
+  echo
+  echo "PLAN_EXIT_CODE=$?"
+  set -e
+} >"$OUT/tests/current_plan.txt" 2>&1
+
+# Host facts
+run "host/hostnamectl" hostnamectl
+run "host/os_release" cat /etc/os-release
+run "host/uname" uname -a
+run "host/lscpu" lscpu
+run "host/memory" free -h
+run "host/meminfo" cat /proc/meminfo
+run "host/df" df -hT
+run "host/block" lsblk -e7 -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL
+runsh "host/virt_support" "egrep -o 'vmx|svm' /proc/cpuinfo | sort -u; systemd-detect-virt || true; sudo kvm-ok 2>/dev/null || true"
+runsh "host/users_groups" "id; getent group libvirt; getent group kvm"
+runsh "host/time" "timedatectl; date -Is"
+
+# Network and firewall
+run "network/ip_addr" ip -details -br addr
+run "network/ip_link" ip -details link
+run "network/ip_route" ip -4 route show table all
+run "network/ip_rule" ip -4 rule show
+run "network/bridge" bridge -details link show
+run "network/bridge_vlan" bridge vlan show
+run "network/listeners" sudo ss -lntup
+runsh "network/nm_devices" "nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null || true"
+runsh "network/nm_connections" "nmcli -t -f NAME,UUID,TYPE,DEVICE connection show 2>/dev/null || true"
+runsh "network/resolver" "resolvectl status 2>/dev/null || true; echo; cat /etc/resolv.conf"
+runsh "network/nft" "sudo nft list ruleset 2>/dev/null || true"
+runsh "network/iptables" "sudo iptables-save 2>/dev/null || true; echo '---IPv6---'; sudo ip6tables-save 2>/dev/null || true"
+runsh "network/sysctls" "sysctl net.ipv4.ip_forward net.ipv4.ip_unprivileged_port_start 2>/dev/null || true; sysctl -a 2>/dev/null | grep -E '(^net\.ipv4\.conf\..*\.rp_filter|^net\.bridge\.|^net\.ipv4\.ip_forward)' || true"
+
+# libvirt host
+run "libvirt/version" virsh version
+run "libvirt/uri" virsh uri
+run "libvirt/capabilities" virsh capabilities
+run "libvirt/domains" virsh list --all
+run "libvirt/networks" virsh net-list --all
+run "libvirt/pools" virsh pool-list --all
+runsh "libvirt/nodeinfo" "virsh nodeinfo; virsh freecell --all 2>/dev/null || true"
+runsh "libvirt/nwfilter_runtime" "systemctl status virtnwfilterd.socket virtnwfilterd.service --no-pager -l 2>&1 || true; echo; systemctl list-unit-files 'virtnwfilterd*' --no-pager 2>&1 || true"
+runsh "libvirt/nwfilter_inventory" "virsh nwfilter-list 2>&1 || true; echo '--- bindings ---'; virsh nwfilter-binding-list 2>&1 || true"
+runsh "libvirt/nwfilter_definitions" "find /etc/libvirt/nwfilter -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort || true; echo '--- clean-traffic ---'; grep -RIl 'clean-traffic' /etc/libvirt/nwfilter /usr/share/libvirt 2>/dev/null || true"
+
+while IFS= read -r net; do
+  [[ -n "$net" ]] || continue
+  safe="$(printf '%s' "$net" | tr -cs 'A-Za-z0-9._-' '_')"
+  run "libvirt/network_${safe}_info" virsh net-info "$net"
+  run "libvirt/network_${safe}_xml" virsh net-dumpxml "$net"
+  runsh "libvirt/network_${safe}_leases" "virsh net-dhcp-leases '$net' 2>/dev/null || true"
+done < <(virsh net-list --all --name 2>/dev/null)
+
+while IFS= read -r pool; do
+  [[ -n "$pool" ]] || continue
+  safe="$(printf '%s' "$pool" | tr -cs 'A-Za-z0-9._-' '_')"
+  run "libvirt/pool_${safe}_info" virsh pool-info "$pool"
+  run "libvirt/pool_${safe}_xml" virsh pool-dumpxml "$pool"
+  runsh "libvirt/pool_${safe}_volumes" "virsh vol-list '$pool' --details 2>/dev/null || true"
+done < <(virsh pool-list --all --name 2>/dev/null)
+
+# Every VM: XML, interfaces, addresses, disks, snapshots, QGA capability
+while IFS= read -r dom; do
+  [[ -n "$dom" ]] || continue
+  safe="$(printf '%s' "$dom" | tr -cs 'A-Za-z0-9._-' '_')"
+  ddir="$OUT/libvirt/domain_$safe"
+  mkdir -p "$ddir/snapshots"
+
+  virsh dominfo "$dom" >"$ddir/dominfo.txt" 2>&1 || true
+  virsh dumpxml "$dom" >"$ddir/domain.xml" 2>&1 || true
+  virsh domiflist "$dom" >"$ddir/interfaces.txt" 2>&1 || true
+  virsh domifaddr "$dom" --source agent >"$ddir/addresses-agent.txt" 2>&1 || true
+  virsh domifaddr "$dom" --source lease >"$ddir/addresses-lease.txt" 2>&1 || true
+  virsh domifaddr "$dom" --source arp >"$ddir/addresses-arp.txt" 2>&1 || true
+  virsh domblklist "$dom" --details >"$ddir/block-devices.txt" 2>&1 || true
+  virsh domstats "$dom" --balloon --vcpu --interface --block >"$ddir/domstats.txt" 2>&1 || true
+  virsh snapshot-list "$dom" --tree >"$ddir/snapshot-tree.txt" 2>&1 || true
+  virsh snapshot-list "$dom" --metadata >"$ddir/snapshot-list.txt" 2>&1 || true
+
+  while IFS= read -r snap; do
+    [[ -n "$snap" ]] || continue
+    ssafe="$(printf '%s' "$snap" | tr -cs 'A-Za-z0-9._-' '_')"
+    virsh snapshot-dumpxml "$dom" "$snap" >"$ddir/snapshots/$ssafe.xml" 2>&1 || true
+    virsh snapshot-info "$dom" "$snap" >"$ddir/snapshots/$ssafe.info.txt" 2>&1 || true
+  done < <(virsh snapshot-list "$dom" --name 2>/dev/null)
+
+  virsh qemu-agent-command "$dom" '{"execute":"guest-ping"}' >"$ddir/qga-guest-ping.json" 2>&1 || true
+  virsh qemu-agent-command "$dom" '{"execute":"guest-info"}' >"$ddir/qga-guest-info.json" 2>&1 || true
+  virsh qemu-agent-command "$dom" '{"execute":"guest-get-osinfo"}' >"$ddir/qga-osinfo.json" 2>&1 || true
+  virsh qemu-agent-command "$dom" '{"execute":"guest-network-get-interfaces"}' >"$ddir/qga-network.json" 2>&1 || true
+
+  awk '$1=="file" {print $3}' "$ddir/block-devices.txt" 2>/dev/null | while read -r disk; do
+    [[ -f "$disk" ]] || continue
+    dsafe="$(basename "$disk" | tr -cs 'A-Za-z0-9._-' '_')"
+    if ! sudo qemu-img info --backing-chain "$disk" >"$ddir/qemu-img-$dsafe.txt" 2>&1; then
+      # A running QEMU guest may hold the normal image lock. Retry only the
+      # read-only metadata probe with explicit shared access so inventory still
+      # captures the real format/backing chain without touching guest storage.
+      sudo qemu-img info --force-share --backing-chain "$disk" >"$ddir/qemu-img-$dsafe.txt" 2>&1 || true
+    fi
+  done
+done < <(virsh list --all --name 2>/dev/null)
+
+# CAPE: discover service candidates and installation root without assuming
+# unit names, usernames or installation paths. Service WorkingDirectory wins;
+# filesystem discovery is used only when it resolves uniquely.
+CAPE_ROOT=""
+CAPE_SERVICE_CANDIDATES=()
+mapfile -t CAPE_SERVICE_CANDIDATES < <(
+  {
+    systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}'
+    systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}'
+  } | sed '/^$/d' | sort -u | while read -r unit; do
+    wd="$(systemctl show "$unit" -p WorkingDirectory --value 2>/dev/null || true)"
+    execstart="$(systemctl show "$unit" -p ExecStart --value 2>/dev/null || true)"
+    if [[ "$unit" =~ [Cc][Aa][Pp][Ee]|[Cc][Uu][Cc][Kk][Oo][Oo] ]] ||
+       [[ "$wd" =~ CAPE|cape|cuckoo|Cuckoo ]] ||
+       [[ "$execstart" =~ CAPE|cape|cuckoo|Cuckoo ]]; then
+      printf '%s\n' "$unit"
+    fi
+  done
+)
+
+declare -a CAPE_ROOTS=()
+for svc in "${CAPE_SERVICE_CANDIDATES[@]:-}"; do
+  wd="$(systemctl show "$svc" -p WorkingDirectory --value 2>/dev/null || true)"
+  while [[ -n "$wd" && "$wd" != / ]]; do
+    if [[ -f "$wd/conf/kvm.conf" ]]; then
+      CAPE_ROOTS+=("$(readlink -f "$wd")")
+      break
+    fi
+    wd="$(dirname "$wd")"
+  done
+done
+
+if (("${#CAPE_ROOTS[@]}" > 0)); then
+  mapfile -t CAPE_ROOTS < <(printf '%s\n' "${CAPE_ROOTS[@]}" | sed '/^$/d' | sort -u)
+fi
+if (("${#CAPE_ROOTS[@]}" == 1)); then
+  CAPE_ROOT="${CAPE_ROOTS[0]}"
+elif (("${#CAPE_ROOTS[@]}" == 0)); then
+  mapfile -t CAPE_ROOTS < <(
+    find /opt /srv /usr/local /home /var/lib -maxdepth 6 -type f -path '*/conf/kvm.conf' -printf '%h\n' 2>/dev/null |
+      sed 's#/conf$##' | sort -u
+  )
+  (("${#CAPE_ROOTS[@]}" == 1)) && CAPE_ROOT="${CAPE_ROOTS[0]}"
+fi
+printf '%s\n' "$CAPE_ROOT" >"$OUT/cape/detected-root.txt"
+printf '%s\n' "${CAPE_SERVICE_CANDIDATES[@]:-}" >"$OUT/cape/discovered-service-candidates.txt"
+
+for svc in "${CAPE_SERVICE_CANDIDATES[@]:-}"; do
+  safe_svc="$(printf '%s' "$svc" | tr -cs 'A-Za-z0-9._-' '_')"
+  systemctl cat "$svc" >"$OUT/cape/systemd-$safe_svc.txt" 2>&1 || true
+  systemctl show "$svc" -p Id -p User -p Group -p WorkingDirectory -p ExecStart -p MainPID -p ActiveState -p SubState >"$OUT/cape/systemd-$safe_svc-properties.txt" 2>&1 || true
+  systemctl status "$svc" --no-pager -l >"$OUT/cape/systemd-$safe_svc-status.txt" 2>&1 || true
+  journalctl -u "$svc" -n 250 --no-pager >"$OUT/cape/journal-$safe_svc.txt" 2>&1 || true
+done
+
+if [[ -n "$CAPE_ROOT" && -d "$CAPE_ROOT" ]]; then
+  runsh "cape/git" "git -C '$CAPE_ROOT' rev-parse HEAD; git -C '$CAPE_ROOT' branch --show-current; git -C '$CAPE_ROOT' status --short; git -C '$CAPE_ROOT' log -8 --oneline --decorate"
+  git -C "$CAPE_ROOT" remote -v 2>/dev/null | sed -E 's#(https?://)[^/@[:space:]]+@#\1***REDACTED***@#g' >"$OUT/cape/git-remotes-redacted.txt" || true
+
+  runsh "cape/root_listing" "find '$CAPE_ROOT' -maxdepth 3 -type f -printf '%P\n' | sort | head -5000"
+  runsh "cape/relevant_permissions" "stat -c '%A %a %U:%G %s %n' '$CAPE_ROOT/conf/kvm.conf' '$CAPE_ROOT/conf/auxiliary.conf' '$CAPE_ROOT/conf/processing.conf' '$CAPE_ROOT/conf/routing.conf' '$CAPE_ROOT/modules/auxiliary/sniffer.py' '$CAPE_ROOT/web/analysis/views.py' 2>/dev/null || true"
+  runsh "cape/relevant_hashes" "sha256sum '$CAPE_ROOT/conf/kvm.conf' '$CAPE_ROOT/conf/auxiliary.conf' '$CAPE_ROOT/conf/processing.conf' '$CAPE_ROOT/conf/routing.conf' '$CAPE_ROOT/modules/auxiliary/sniffer.py' '$CAPE_ROOT/web/analysis/views.py' 2>/dev/null || true"
+
+  for rel in conf/kvm.conf conf/auxiliary.conf conf/processing.conf conf/routing.conf conf/cuckoo.conf conf/web.conf; do
+    [[ -f "$CAPE_ROOT/$rel" ]] || continue
+    redact_conf "$CAPE_ROOT/$rel" "$OUT/cape/$(basename "$rel").redacted.txt"
+  done
+
+  for rel in modules/auxiliary/sniffer.py web/analysis/views.py modules/machinery/kvm.py lib/cuckoo/core/database.py lib/cuckoo/common/constants.py; do
+    [[ -f "$CAPE_ROOT/$rel" ]] || continue
+    cp -a "$CAPE_ROOT/$rel" "$OUT/cape/source-$(printf '%s' "$rel" | tr '/' '_')"
+  done
+
+  runsh "cape/source_index" "grep -RniE 'class KVM|snapshot|ResultServer|resultserver|TASK_(PENDING|RUNNING|COMPLETED|REPORTED)|capture_host|self\.machine\.ip|dnswhitelist|ipwhitelist|route[[:space:]]*=' '$CAPE_ROOT/lib' '$CAPE_ROOT/modules' '$CAPE_ROOT/web' 2>/dev/null | head -3000"
+  runsh "cape/extension_markers" "grep -RniE 'CAPE_INETSIM_VM_|inetsim_vm|INetSim Visual' '$CAPE_ROOT/web' 2>/dev/null | head -1000 || true"
+
+  for svc in cape cape-web cape-processor; do
+    pid="$(systemctl show "$svc" -p MainPID --value 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 0 ]]; then
+      ps -p "$pid" -o pid=,user=,group=,args= >"$OUT/cape/process-$svc.txt" 2>&1 || true
+      source "$ROOT/lib/cape-runtime.sh"
+      exe="$(cape_service_python "$svc.service" 2>"$OUT/cape/python-$svc-discovery-error.txt" || true)"
+      service_user="$(systemctl show "$svc" -p User --value 2>/dev/null || true)"
+      service_user="${service_user:-root}"
+      if [[ -n "$exe" ]]; then
+        cape_run_as_user "$service_user" "$exe" --version >"$OUT/cape/python-$svc-version.txt" 2>&1 || true
+        cape_run_as_user "$service_user" "$exe" -m pip freeze >"$OUT/cape/python-$svc-pip-freeze.txt" 2>&1 || true
+      fi
+    fi
+  done
+fi
+
+# Windows-management reachability. Read-only probes only; no guest configuration changes.
+# Probe every configured CAPE machine independently; never collapse a multi-VM
+# inventory to the last "ip =" line in kvm.conf.
+if [[ -f "$OUT/cape/kvm.conf.redacted.txt" ]]; then
+  python3 - "$OUT/cape/kvm.conf.redacted.txt" <<'PY' |
+import configparser,sys
+p=sys.argv[1]
+c=configparser.ConfigParser(interpolation=None,strict=False)
+c.optionxform=str.lower
+c.read(p)
+machines=[]
+if c.has_section("kvm"):
+    machines=[x.strip() for x in c.get("kvm","machines",fallback="").split(",") if x.strip()]
+for name in machines:
+    if not c.has_section(name):
+        continue
+    ip=c.get(name,"ip",fallback="").strip()
+    platform=c.get(name,"platform",fallback="windows").strip().lower()
+    if ip and platform.startswith("windows"):
+        print(name+"|"+ip)
+PY
+  while IFS='|' read -r label ip; do
+    [[ -n "$label" && -n "$ip" ]] || continue
+    safe="$(printf '%s' "$label" | tr -cs 'A-Za-z0-9._-' '_')"
+    wdir="$OUT/windows/$safe"
+    mkdir -p "$wdir"
+    for p in 8000 5985 5986 3389 445; do
+      {
+        echo "machine=$label target=$ip port=$p"
+        timeout 2 bash -c "</dev/tcp/$ip/$p" >/dev/null 2>&1 && echo OPEN || echo CLOSED
+      } >"$wdir/port-$p.txt"
+    done
+    curl -fsS --max-time 3 -D "$wdir/cape-agent-root-headers.txt" "http://$ip:8000/" -o "$wdir/cape-agent-root-body.txt" 2>"$wdir/cape-agent-root-error.txt" || true
+    head -c 16384 "$wdir/cape-agent-root-body.txt" >"$wdir/cape-agent-root-body-truncated.txt" 2>/dev/null || true
+    rm -f "$wdir/cape-agent-root-body.txt"
+  done
+fi
+
+# Packages/tools
+runsh "packages/virtualization" "dpkg-query -W 2>/dev/null | grep -E '^(qemu|libvirt|virt-manager|virtinst|libguestfs|guestfs|ovmf|dnsmasq|bridge-utils|iproute2|nftables|iptables)[[:space:]]' || true"
+runsh "packages/cape_related" "dpkg-query -W 2>/dev/null | grep -E '^(python3|tcpdump|suricata|yara|libpcap|postgresql|mongodb|redis)[[:space:]]' || true"
+runsh "packages/tools" "for x in qemu-img virt-install virt-sysprep guestfish python3 git curl jq tcpdump; do printf '%-18s ' \"\$x\"; command -v \"\$x\" || true; done; printf '%-18s ' virsh; command -v /usr/bin/virsh || true"
+runsh "packages/python" "python3 --version; pip3 --version 2>/dev/null || true"
+
+python3 "$ROOT/tools/redact_inventory.py" "$OUT" >"$OUT/tests/redaction-summary.txt"
+find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum >"$OUT/SHA256SUMS"
+tar -czf "$ARCHIVE" -C "$OUT_BASE" "$(basename "$OUT")"
+sha256sum "$ARCHIVE" >"${ARCHIVE}.sha256"
+rm -rf "$OUT"
+
+if [[ "$(id -u)" -eq 0 && "$OUTPUT_USER" != root ]]; then
+  OUTPUT_GROUP="$(id -gn "$OUTPUT_USER" 2>/dev/null || printf '%s' "$OUTPUT_USER")"
+  chown "$OUTPUT_USER:$OUTPUT_GROUP" "$ARCHIVE" "${ARCHIVE}.sha256" 2>/dev/null || true
+fi
+
+echo
+echo "================================================================"
+echo "DEEP READ-ONLY INVENTORY COMPLETE"
+echo "================================================================"
+echo "Archive:"
+echo "$ARCHIVE"
+echo
+echo "Checksum:"
+cat "${ARCHIVE}.sha256"
+echo
+echo "No CAPE/libvirt/Windows/network configuration was changed."
+echo "Upload the .tar.gz file."
